@@ -118,7 +118,6 @@ def test_op_reshape_subshape(input_shape, replacement_shape, begin_axis, end_axi
                     forward_input, expected_forward, expected_backward,
                     device_id=device_id, precision=precision)
 
-
 # Test that reshape accumulates the gradient in its input operand
 # instead of overwriting the input operand gradient
 def test_op_reshape_gradient_accumulation(device_id, precision):
@@ -367,41 +366,52 @@ def test_op_splice(input_data1, input_data2, axis, expected_result, device_id, p
 
     input_data1 = AA(input_data1, dtype=PRECISION_TO_TYPE[precision])
     input_data2 = AA(input_data2, dtype=PRECISION_TO_TYPE[precision])
-    a = C.input_variable(shape=input_data1.shape,
-                dtype=sanitize_dtype_cntk(PRECISION_TO_TYPE[precision]),
-                needs_gradient=True,
-                name='a')
-    b = C.input_variable(shape=input_data2.shape,
-                dtype=sanitize_dtype_cntk(PRECISION_TO_TYPE[precision]),
-                needs_gradient=True,
-                name='b')
 
-    # create batch
-    input_data1.shape = (1,) + input_data1.shape
-    input_data2.shape = (1,) + input_data2.shape
+    def test_splice(shape1, shape2):
+        a = C.input_variable(shape=shape1,
+                    dtype=sanitize_dtype_cntk(PRECISION_TO_TYPE[precision]),
+                    needs_gradient=True,
+                    name='a')
+        b = C.input_variable(shape=shape2,
+                    dtype=sanitize_dtype_cntk(PRECISION_TO_TYPE[precision]),
+                    needs_gradient=True,
+                    name='b')
 
-    # splice using the operator
-    root_op = C.splice(a, b, axis=axis, name='splice_ab')
+        # create batch
+        input_data1.shape = (1,) + input_data1.shape
+        input_data2.shape = (1,) + input_data2.shape
 
-    forward_input = {a: input_data1, b: input_data2}
+        # splice using the operator
+        root_op = C.splice(a, b, axis=axis, name='splice_ab')
 
-    # Backward pass test
-    # ==================
-    # The gradient of the splice operator is all ones in the shape of the input
+        forward_input = {a: input_data1, b: input_data2}
 
-    def grad_splice(x):
-        return np.ones_like(x)
+        # Backward pass test
+        # ==================
+        # The gradient of the splice operator is all ones in the shape of the input
 
-    expected_forward = [expected_result]
-    expected_backward = {
-        a: grad_splice(np.asarray(input_data1)),
-        b: grad_splice(np.asarray(input_data2))
-    }
+        def grad_splice(x):
+            return np.ones_like(x)
 
-    unittest_helper(root_op,
-                    forward_input, expected_forward, expected_backward,
-                    device_id=device_id, precision=precision)
+        expected_forward = [expected_result]
+        expected_backward = {
+            a: grad_splice(np.asarray(input_data1)),
+            b: grad_splice(np.asarray(input_data2))
+        }
 
+        unittest_helper(root_op,
+                        forward_input, expected_forward, expected_backward,
+                        device_id=device_id, precision=precision)
+
+    test_splice(input_data1.shape, input_data2.shape)
+    # test with free dimension axis
+    if axis is int and axis >= 0:
+        input_shape1 = list(input_data1.shape)
+        input_shape2 = list(input_data2.shape)
+
+        input_shape1[axis] = C.FreeDimension
+        input_shape2[axis] = C.FreeDimension
+        test_splice(input_shape1, input_shape2)
 
 
 def test_swapaxes_0d_1d_operands():
@@ -462,6 +472,46 @@ def test_op_reshape_free_dimension(device_id):
     result = x_reshaped_2.eval({x : np.asarray(data, dtype=np.float32)})
     assert np.array_equal(result[0], np.reshape(data, (2, 4)))
 
+RESHAPE_MULTIPLE_FREE_DIMENSION_TEST_CASES = [
+    #(input_shape, replacement_shape, expected_output_shape)
+    ((2, 3),    (3, -1),    (1, 3, 2)),
+    ((4, 5, 7), (5, -1, 4), (1, 5, 7, 4)),
+    ((3, 4, 2), (12, 2), (1, 12, 2)),
+]
+
+@pytest.mark.parametrize("input_shape, replacement_shape, expected_output_shape", RESHAPE_MULTIPLE_FREE_DIMENSION_TEST_CASES)
+def test_op_reshape_multiple_free_dimensions(input_shape, replacement_shape, expected_output_shape, device_id, precision):
+    dev = cntk_device(device_id)
+    from cntk.internal import sanitize_dtype_cntk
+    from .. import reshape, element_times
+
+    num_tensor_elements = np.multiply.reduce(input_shape)
+    input_tensor = np.arange(
+        num_tensor_elements, dtype=PRECISION_TO_TYPE[precision]).reshape(input_shape)
+    input_reshaped = input_tensor.reshape(expected_output_shape)
+    
+    a = C.input_variable(shape=tuple([C.FreeDimension]*len(input_tensor.shape)),
+              dtype=sanitize_dtype_cntk(PRECISION_TO_TYPE[precision]),
+              needs_gradient=True,
+              name='a')
+
+    a_reshaped = reshape(a, replacement_shape)
+
+    const_input_reshaped = constant(input_reshaped, device=dev)
+    input_op = element_times(a_reshaped, const_input_reshaped)
+
+    expected_forward = [input_reshaped**2]
+    expected_backward = {a: input_tensor}
+
+    # create batch
+    input_tensor.shape = (1,) + input_tensor.shape
+
+    forward_input = {a: input_tensor}
+
+    unittest_helper(input_op,
+                    forward_input, expected_forward, expected_backward,
+                    device_id=device_id, precision=precision)
+
 def test_gather_op(device_id, precision):
     a_data = [AA([[0],[1]], dtype=PRECISION_TO_TYPE[precision]),
               AA([[3],[4]], dtype=PRECISION_TO_TYPE[precision])]
@@ -515,24 +565,25 @@ def test_gather_op(device_id, precision):
 def test_convert_dynamic_axis():
     #test fix batch size
     batch_size = 4
-    a = C.constant(shape=(batch_size, 2, 3), value=1)
+    a = C.parameter(shape=(batch_size, 2, 3), init=1)
     dynamic_a = C.to_batch(a)
     assert len(dynamic_a.dynamic_axes) == 1
     assert dynamic_a.shape == (2, 3)
 
     x = C.input_variable((2, 3))
-    y = x + dynamic_a
+    y = x * dynamic_a
+
+    #test grad
+    data = np.arange(batch_size * 2 * 3).reshape(batch_size, 2, 3).astype('f')
+    assert np.array_equal(y.grad({x:data}, [a]), data)
 
     const_a = C.unpack_batch(y)
     assert len(const_a.dynamic_axes) == 0
     assert const_a.shape == (C.FreeDimension, 2, 3)
 
     f = C.assign(a, const_a)
-    z = x + 1
-    data = np.arange(24).reshape(4, 2, 3).astype('f')
     f.eval({x:data})
-    expected = z.eval({x:data})
-    assert np.array_equal(a.value, expected)
+    assert np.array_equal(a.value, data)
 
     #test reshape with batch axis
     x = C.input_variable((2,3))
@@ -601,3 +652,47 @@ def test_pad():
     expect_grad2 = np.asarray([[4., 6., 4.], [4., 6., 4.]])
     assert np.array_equal(grad2, expect_grad2)
 
+def test_crop():
+    # Small network.
+    node_input = C.input_variable((1, 5, 5))
+    node_referent = C.input_variable((1, 5, 5))
+    node_output = C.layers.Sequential([
+        C.layers.Convolution2D(filter_shape = (3, 3),
+                               num_filters = 1,
+                               init = 1,
+                               strides = (2, 2),
+                               pad = True,
+                               bias = False),
+        C.layers.MaxPooling(filter_shape = (3, 3),
+                            strides = (2, 2),
+                            pad = True),
+        C.layers.ConvolutionTranspose(filter_shape = (4, 4),
+                                      num_filters = 1,
+                                      strides = (4, 4),
+                                      init = 1,
+                                      bias = False)])(node_input)
+
+    # Input data.
+    input_map = {
+        node_input: -np.arange(25).reshape(1, 1, 5, 5).astype(np.float32),
+        node_referent: np.zeros([1, 1, 5, 5]).astype(np.float32)
+    }
+
+    # Expected cropped output.
+    expected = [-12, -12, -12, -24, -24] * 3 + [-63, -63, -63, -81, -81] * 2
+    expected = np.asarray(expected, dtype = np.float32).reshape(1, 1, 5, 5)
+
+    # Test crop with explicitly specified offsets.
+    cropped = C.crop_manual(node_output, node_referent, 1, 1).eval(input_map)
+    assert np.array_equal(cropped, expected)
+
+    # Test crop with automatically computed offsets where inputs
+    # have common ancestor.
+    cropped = C.crop_automatic(node_output, node_input).eval(input_map)
+    assert np.array_equal(cropped, expected)
+
+    # Test crop with automatically computed offsets where inputs do not
+    # have common ancestor.
+    cropped = C.crop_automatic_with_ancestors(
+        node_output, node_referent, node_input, node_referent).eval(input_map)
+    assert np.array_equal(cropped, expected)
